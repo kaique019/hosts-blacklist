@@ -1,0 +1,11 @@
+[Unit]
+Description=Verificação periódica da blacklist no /etc/hosts
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+AccuracySec=30s
+Unit=hosts-blacklist.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=Baixa as listas de bloqueio e atualiza o /etc/hosts
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/hosts-blacklist update
+SyslogIdentifier=hosts-blacklist-update
+StateDirectory=hosts-blacklist
+TimeoutStartSec=15min
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc /run
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes

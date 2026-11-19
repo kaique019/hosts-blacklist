@@ -1,0 +1,772 @@
+#!/usr/bin/env bash
+#
+# hosts-blacklist - mantém uma blacklist de domínios em um bloco delimitado
+# do /etc/hosts, sem tocar no restante do arquivo.
+#
+#  * Só mexe entre os marcadores BEGIN/END; o resto do arquivo é preservado.
+#  * Se o bloco já está correto, não escreve nada (evita ciclos com o inotify).
+#  * Escrita atômica (arquivo temporário + rename), com fallback para bind mounts.
+#  * Nunca altera as listas de origem: local.txt, allowlist.txt e o cache
+#    das fontes ficam separados do resultado final.
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+readonly VERSION="1.0.0"
+readonly PROG="hosts-blacklist"
+
+CONF_DIR=${HB_CONF_DIR:-/etc/hosts-blacklist}
+STATE_DIR=${HB_STATE_DIR:-/var/lib/hosts-blacklist}
+HOSTS_FILE=${HB_HOSTS_FILE:-/etc/hosts}
+LOCK_FILE=${HB_LOCK_FILE:-/run/hosts-blacklist.lock}
+
+readonly MARK_BEGIN="# BEGIN hosts-blacklist"
+readonly MARK_END="# END hosts-blacklist"
+
+# Códigos de saída
+readonly E_USAGE=1
+readonly E_CONFIG=2
+readonly E_AMBIGUOUS=3
+readonly E_WRITE=4
+readonly E_LOCK=5
+readonly E_EMPTY=6
+readonly E_SOURCES=7
+
+# Padrões (sobrescritos por config.conf)
+BLOCK_ADDRESS="0.0.0.0"
+BLOCK_ADDRESS6="::"
+BLOCK_IPV6="no"
+HOSTS_PER_LINE=1
+BACKUP="yes"
+IMMUTABLE="no"
+ALLOW_HTTP="no"
+CURL_TIMEOUT=30
+MAX_SOURCE_BYTES=52428800
+MIN_SOURCE_DOMAINS=10
+MIN_SOURCE_RATIO=50
+
+VERBOSE=0
+DRY_RUN=0
+FORCE=0
+WORK=""
+HOSTS_STATE=""
+BLK_S=0
+BLK_E=0
+
+# --------------------------------------------------------------------------
+# Utilitários
+# --------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Uso: $PROG [opções] [comando]
+
+Comandos:
+  apply     (padrão) garante que o bloco esteja presente e correto no hosts
+  update    baixa as fontes de sources.txt, valida e depois executa apply
+  check     verifica o bloco sem alterar nada (saída 0 = íntegro, 1 = diverge)
+  status    mostra um resumo do estado atual
+  remove    remove o bloco gerenciado do hosts
+
+Opções:
+  -n, --dry-run   mostra o que seria feito, sem escrever nada
+  -f, --force     ignora travas de segurança (marcadores ambíguos, lista vazia)
+  -v, --verbose   mensagens de depuração
+  -h, --help      esta ajuda
+  -V, --version   versão
+
+Variáveis de ambiente (testes e empacotamento):
+  HB_CONF_DIR  HB_STATE_DIR  HB_HOSTS_FILE  HB_LOCK_FILE
+EOF
+}
+
+log() {
+  local level=$1
+  shift
+  if [[ $level == debug && $VERBOSE -eq 0 ]]; then
+    return 0
+  fi
+  if [[ -n ${JOURNAL_STREAM:-} ]]; then
+    local pri
+    case $level in
+      err) pri=3 ;;
+      warn) pri=4 ;;
+      info) pri=6 ;;
+      *) pri=7 ;;
+    esac
+    printf '<%s>%s\n' "$pri" "$*" >&2
+  else
+    printf '%s: %s\n' "$level" "$*" >&2
+  fi
+}
+
+die() {
+  log err "$1"
+  exit "${2:-$E_USAGE}"
+}
+
+cleanup() {
+  if [[ -n $WORK && -d $WORK ]]; then
+    rm -rf -- "$WORK"
+  fi
+}
+
+check_deps() {
+  local c
+  local -a missing=()
+  for c in awk sed grep sort comm sha256sum mktemp stat cut wc tail install cat; do
+    if ! command -v "$c" >/dev/null 2>&1; then
+      missing+=("$c")
+    fi
+  done
+  if ((${#missing[@]} > 0)); then
+    die "comandos ausentes: ${missing[*]}" "$E_CONFIG"
+  fi
+}
+
+acquire_lock() {
+  mkdir -p -- "$(dirname -- "$LOCK_FILE")" 2>/dev/null || true
+  command -v flock >/dev/null 2>&1 || die "flock não encontrado (pacote util-linux)" "$E_CONFIG"
+  exec 9>"$LOCK_FILE" || die "não foi possível abrir o lock $LOCK_FILE" "$E_LOCK"
+  flock -w 120 9 || die "não foi possível obter o lock $LOCK_FILE" "$E_LOCK"
+}
+
+# --------------------------------------------------------------------------
+# Configuração
+# --------------------------------------------------------------------------
+
+validate_config() {
+  local v
+  [[ $BLOCK_ADDRESS =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    die "BLOCK_ADDRESS inválido: $BLOCK_ADDRESS" "$E_CONFIG"
+  [[ $BLOCK_ADDRESS6 =~ ^[0-9A-Fa-f:]+$ ]] ||
+    die "BLOCK_ADDRESS6 inválido: $BLOCK_ADDRESS6" "$E_CONFIG"
+  [[ $HOSTS_PER_LINE =~ ^[1-9]$ ]] ||
+    die "HOSTS_PER_LINE deve ser um número de 1 a 9" "$E_CONFIG"
+  for v in CURL_TIMEOUT MAX_SOURCE_BYTES MIN_SOURCE_DOMAINS MIN_SOURCE_RATIO; do
+    [[ ${!v} =~ ^[0-9]+$ ]] || die "$v deve ser um número inteiro" "$E_CONFIG"
+  done
+  for v in BLOCK_IPV6 BACKUP IMMUTABLE ALLOW_HTTP; do
+    case ${!v,,} in
+      yes | true | 1 | on) printf -v "$v" '%s' yes ;;
+      no | false | 0 | off) printf -v "$v" '%s' no ;;
+      *) die "$v deve ser yes ou no" "$E_CONFIG" ;;
+    esac
+  done
+}
+
+load_config() {
+  local file=$CONF_DIR/config.conf line key val
+  if [[ -r $file ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      line=${line%%#*}
+      line=${line#"${line%%[![:space:]]*}"}
+      line=${line%"${line##*[![:space:]]}"}
+      if [[ -z $line ]]; then
+        continue
+      fi
+      if [[ $line =~ ^([A-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+        key=${BASH_REMATCH[1]}
+        val=${BASH_REMATCH[2]}
+        val=${val#\"}
+        val=${val%\"}
+        case $key in
+          BLOCK_ADDRESS | BLOCK_ADDRESS6 | BLOCK_IPV6 | HOSTS_PER_LINE | BACKUP | \
+            IMMUTABLE | ALLOW_HTTP | CURL_TIMEOUT | MAX_SOURCE_BYTES | \
+            MIN_SOURCE_DOMAINS | MIN_SOURCE_RATIO)
+            printf -v "$key" '%s' "$val"
+            ;;
+          *) log warn "config.conf: chave desconhecida ignorada: $key" ;;
+        esac
+      else
+        log warn "config.conf: linha inválida ignorada: $line"
+      fi
+    done <"$file"
+  fi
+  validate_config
+}
+
+# --------------------------------------------------------------------------
+# Normalização e montagem da lista
+# --------------------------------------------------------------------------
+
+# Lê listas em formato "um domínio por linha" ou "formato hosts" e imprime
+# apenas nomes de host válidos, em minúsculas. Linhas de hosts que apontam
+# para IPs reais são descartadas.
+read -r -d '' AWK_NORMALIZE <<'AWK' || true
+BEGIN {
+  n = split("localhost localhost.localdomain local broadcasthost ip6-localhost ip6-loopback ip6-localnet ip6-mcastprefix ip6-allnodes ip6-allrouters ip6-allhosts", s, " ")
+  for (i = 1; i <= n; i++) skip[s[i]] = 1
+  n = split("0.0.0.0 127.0.0.1 127.0.1.1 :: ::1", s, " ")
+  for (i = 1; i <= n; i++) sink[s[i]] = 1
+}
+function valid(d,    parts, k, np, lbl) {
+  if (length(d) > 253 || length(d) < 3) return 0
+  np = split(d, parts, ".")
+  if (np < 2) return 0
+  for (k = 1; k <= np; k++) {
+    lbl = parts[k]
+    if (length(lbl) < 1 || length(lbl) > 63) return 0
+    if (lbl !~ /^[a-z0-9_-]+$/) return 0
+    if (lbl ~ /^-/ || lbl ~ /-$/) return 0
+  }
+  if (parts[np] ~ /^[0-9]+$/) return 0
+  return 1
+}
+{
+  sub(/\r$/, "")
+  sub(/[ \t]*#.*$/, "")
+  gsub(/^[ \t]+|[ \t]+$/, "")
+  if ($0 == "") next
+  nf = split($0, f, /[ \t]+/)
+  start = 1
+  if (f[1] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (f[1] ~ /:/ && f[1] ~ /^[0-9A-Fa-f:.]+$/)) {
+    if (!(f[1] in sink)) next
+    start = 2
+  }
+  for (i = start; i <= nf; i++) {
+    d = tolower(f[i])
+    sub(/\.$/, "", d)
+    if (d in skip) continue
+    if (valid(d)) print d
+  }
+}
+AWK
+
+normalize() {
+  LC_ALL=C awk "$AWK_NORMALIZE" "$@" | LC_ALL=C sort -u
+}
+
+# Imprime "nome url" para cada fonte configurada.
+read_sources() {
+  local file=$CONF_DIR/sources.txt line name url extra
+  if [[ ! -r $file ]]; then
+    return 0
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    line=${line%%[[:space:]]#*}
+    name="" url="" extra=""
+    read -r name url extra <<<"$line" || true
+    if [[ -z $name ]]; then
+      continue
+    fi
+    if [[ -z $url ]]; then
+      url=$name
+      name=$(printf '%s' "$url" | sha256sum | cut -c1-12)
+    fi
+    name=${name//[^A-Za-z0-9._-]/_}
+    printf '%s %s\n' "$name" "$url"
+  done <"$file"
+}
+
+# Hosts das URLs das fontes: nunca são bloqueados, senão a atualização
+# travaria a si mesma.
+source_hosts() {
+  local _ url
+  while read -r _ url; do
+    printf '%s\n' "$url" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://([^/@]*@)?([^/:?#]+).*#\2#'
+  done < <(read_sources)
+}
+
+build_allowlist() {
+  {
+    if [[ -r $CONF_DIR/allowlist.txt ]]; then
+      cat -- "$CONF_DIR/allowlist.txt"
+    fi
+    hostname 2>/dev/null || true
+    source_hosts
+  } | normalize >"$1"
+}
+
+build_merged() {
+  local out=$1
+  local -a files=()
+  if [[ -r $CONF_DIR/local.txt ]]; then
+    files+=("$CONF_DIR/local.txt")
+  fi
+  files+=("$STATE_DIR"/cache/*.list)
+  if ((${#files[@]} > 0)); then
+    normalize "${files[@]}" >"$WORK/all.txt"
+  else
+    : >"$WORK/all.txt"
+  fi
+  build_allowlist "$WORK/allow.txt"
+  LC_ALL=C comm -23 "$WORK/all.txt" "$WORK/allow.txt" >"$out"
+}
+
+build_block() { # $1 = lista final, $2 = arquivo de saída
+  local merged=$1 out=$2 count
+  count=$(wc -l <"$merged")
+  {
+    printf '%s\n' "$MARK_BEGIN"
+    printf '# gerenciado por %s: %s domínios. Não edite dentro deste bloco.\n' "$PROG" "$count"
+    awk -v a="$BLOCK_ADDRESS" -v a6="$BLOCK_ADDRESS6" -v v6="$BLOCK_IPV6" -v per="$HOSTS_PER_LINE" '
+      function flush() {
+        if (n > 0) {
+          print a buf
+          if (v6 == "yes") print a6 buf
+          buf = ""; n = 0
+        }
+      }
+      { buf = buf " " $0; n++; if (n == per) flush() }
+      END { flush() }
+    ' "$merged"
+    printf '%s\n' "$MARK_END"
+  } >"$out"
+}
+
+# --------------------------------------------------------------------------
+# Análise e escrita do hosts
+# --------------------------------------------------------------------------
+
+# Define HOSTS_STATE: missing | ok | modified | duplicated | ambiguous
+# e, quando há um bloco localizável, BLK_S / BLK_E (linhas inicial e final).
+analyze_hosts() { # $1 = bloco esperado
+  local block=$1 cur exp stray nb ne
+  local -a bs=() es=()
+  BLK_S=0
+  BLK_E=0
+  if [[ ! -e $HOSTS_FILE ]]; then
+    HOSTS_STATE=missing
+    return 0
+  fi
+  mapfile -t bs < <(grep -n -x -F -e "$MARK_BEGIN" -- "$HOSTS_FILE" | cut -d: -f1)
+  mapfile -t es < <(grep -n -x -F -e "$MARK_END" -- "$HOSTS_FILE" | cut -d: -f1)
+  nb=${#bs[@]}
+  ne=${#es[@]}
+  if ((nb == 0 && ne == 0)); then
+    HOSTS_STATE=missing
+    return 0
+  fi
+  if ((nb >= 1 && ne >= 1 && bs[0] < es[ne - 1])); then
+    BLK_S=${bs[0]}
+    BLK_E=${es[ne - 1]}
+    if ((nb == 1 && ne == 1)); then
+      cur=$(sed -n "${BLK_S},${BLK_E}p" "$HOSTS_FILE" | sha256sum | cut -d' ' -f1)
+      exp=$(sha256sum <"$block" | cut -d' ' -f1)
+      if [[ $cur == "$exp" ]]; then
+        HOSTS_STATE=ok
+      else
+        HOSTS_STATE=modified
+      fi
+      return 0
+    fi
+    # Vários marcadores: só é seguro recompor se tudo entre o primeiro BEGIN
+    # e o último END parecer conteúdo de bloqueio (ou comentário/linha vazia).
+    stray=$(sed -n "${BLK_S},${BLK_E}p" "$HOSTS_FILE" |
+      grep -c -v -E '^(#.*|[[:space:]]*|(0\.0\.0\.0|127\.0\.0\.1|::1?)[[:space:]]+[^[:space:]#]+.*)$' || true)
+    if ((stray == 0)); then
+      HOSTS_STATE=duplicated
+    else
+      HOSTS_STATE=ambiguous
+    fi
+    return 0
+  fi
+  HOSTS_STATE=ambiguous
+}
+
+# Monta o novo conteúdo do hosts em $2.
+compose_hosts() { # $1 = bloco, $2 = saída, $3 = acrescentar bloco (1/0)
+  local block=$1 out=$2 append=${3:-1} src=$HOSTS_FILE
+  if [[ ! -e $src ]]; then
+    src=/dev/null
+  fi
+  case $HOSTS_STATE in
+    ok | modified | duplicated)
+      awk -v s="$BLK_S" -v e="$BLK_E" -v bf="$block" '
+        NR == s { while ((getline l < bf) > 0) print l; close(bf) }
+        NR >= s && NR <= e { next }
+        { print }
+      ' "$src" >"$out"
+      ;;
+    missing | ambiguous)
+      if [[ $HOSTS_STATE == ambiguous ]]; then
+        # Remove só as linhas de marcador; nada além disso é apagado.
+        grep -v -x -F -e "$MARK_BEGIN" -e "$MARK_END" -- "$src" >"$out" || true
+      else
+        cat -- "$src" >"$out"
+      fi
+      if ((append)); then
+        if [[ -s $out && -n "$(tail -c1 "$out")" ]]; then
+          printf '\n' >>"$out"
+        fi
+        if [[ -s $out && -n "$(tail -n1 "$out")" ]]; then
+          printf '\n' >>"$out"
+        fi
+        cat -- "$block" >>"$out"
+      fi
+      ;;
+  esac
+}
+
+backup_hosts() {
+  if [[ $BACKUP != yes || ! -e $HOSTS_FILE ]]; then
+    return 0
+  fi
+  if [[ ! -e $STATE_DIR/hosts.orig ]]; then
+    cp -p -- "$HOSTS_FILE" "$STATE_DIR/hosts.orig"
+  fi
+  cp -p -- "$HOSTS_FILE" "$STATE_DIR/hosts.bak"
+}
+
+is_immutable() {
+  local flags=""
+  if ! command -v lsattr >/dev/null 2>&1; then
+    return 1
+  fi
+  read -r flags _ < <(lsattr -d -- "$1" 2>/dev/null) || return 1
+  [[ $flags == *i* ]]
+}
+
+# Escrita atômica: arquivo temporário no mesmo diretório + rename. Preserva
+# dono, permissões e contexto SELinux. Cai para escrita direta se o rename
+# falhar (por exemplo, /etc/hosts como bind mount em containers).
+write_hosts() { # $1 = novo conteúdo
+  local new=$1 target dir tmp was_immutable=0
+  target=$(readlink -f -- "$HOSTS_FILE")
+  dir=$(dirname -- "$target")
+
+  if [[ -e $target ]] && is_immutable "$target"; then
+    was_immutable=1
+    chattr -i -- "$target" || die "não foi possível remover o atributo imutável de $target" "$E_WRITE"
+  fi
+
+  tmp=$(mktemp "$dir/.$PROG.XXXXXX") ||
+    die "não foi possível criar arquivo temporário em $dir (é preciso ser root)" "$E_WRITE"
+  cat -- "$new" >"$tmp"
+  if [[ -e $target ]]; then
+    chmod --reference="$target" -- "$tmp" 2>/dev/null || chmod 0644 -- "$tmp"
+    chown --reference="$target" -- "$tmp" 2>/dev/null || true
+    chcon --reference="$target" -- "$tmp" 2>/dev/null || true
+  else
+    chmod 0644 -- "$tmp"
+  fi
+  sync -- "$tmp" 2>/dev/null || true
+
+  if ! mv -f -- "$tmp" "$target" 2>/dev/null; then
+    log warn "rename atômico falhou em $target (bind mount?); escrevendo no lugar"
+    if ! cat -- "$new" >"$target"; then
+      rm -f -- "$tmp"
+      die "não foi possível escrever em $target" "$E_WRITE"
+    fi
+    rm -f -- "$tmp"
+  fi
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -- "$target" 2>/dev/null || true
+  fi
+
+  if [[ $IMMUTABLE == yes || $was_immutable -eq 1 ]]; then
+    chattr +i -- "$target" 2>/dev/null || log warn "não foi possível aplicar o atributo imutável em $target"
+  fi
+}
+
+show_diff() { # $1 = novo conteúdo
+  local cur=$HOSTS_FILE
+  if [[ ! -e $cur ]]; then
+    cur=/dev/null
+  fi
+  diff -u -- "$cur" "$1" | head -n 40 || true
+}
+
+# --------------------------------------------------------------------------
+# Comandos
+# --------------------------------------------------------------------------
+
+cmd_apply() {
+  local context=${1:-apply} reason="" count
+  if ((!DRY_RUN)); then
+    acquire_lock
+    mkdir -p -- "$STATE_DIR/cache"
+  fi
+  build_merged "$WORK/merged.txt"
+  count=$(wc -l <"$WORK/merged.txt")
+  build_block "$WORK/merged.txt" "$WORK/block.txt"
+  analyze_hosts "$WORK/block.txt"
+
+  if [[ $HOSTS_STATE == ok ]]; then
+    log debug "bloco íntegro ($count domínios); nada a fazer"
+    return 0
+  fi
+
+  if ((count == 0)); then
+    if [[ $HOSTS_STATE == missing ]]; then
+      log debug "lista vazia e nenhum bloco presente; nada a fazer"
+      return 0
+    fi
+    if ((!FORCE)); then
+      die "a lista resolvida está vazia, mas há um bloco no hosts; recusando apagar (use '$PROG remove' ou --force)" "$E_EMPTY"
+    fi
+  fi
+
+  if [[ $HOSTS_STATE == ambiguous ]] && ((!FORCE)); then
+    die "marcadores do bloco em estado ambíguo em $HOSTS_FILE; corrija manualmente ou use --force" "$E_AMBIGUOUS"
+  fi
+
+  case $HOSTS_STATE in
+    missing) reason="bloco ausente" ;;
+    modified)
+      if [[ $context == update ]]; then
+        reason="listas atualizadas"
+      else
+        reason="conteúdo do bloco diverge do esperado"
+      fi
+      ;;
+    duplicated) reason="blocos duplicados" ;;
+    ambiguous) reason="marcadores desbalanceados" ;;
+  esac
+
+  compose_hosts "$WORK/block.txt" "$WORK/hosts.new" 1
+
+  if ((DRY_RUN)); then
+    log info "[dry-run] seria aplicado: $reason ($count domínios)"
+    show_diff "$WORK/hosts.new"
+    return 0
+  fi
+
+  backup_hosts
+  write_hosts "$WORK/hosts.new"
+
+  analyze_hosts "$WORK/block.txt"
+  if [[ $HOSTS_STATE != ok ]]; then
+    if [[ -f $STATE_DIR/hosts.bak ]]; then
+      write_hosts "$STATE_DIR/hosts.bak" || true
+    fi
+    die "verificação após a escrita falhou; backup restaurado" "$E_WRITE"
+  fi
+
+  install -m 0644 -- "$WORK/merged.txt" "$STATE_DIR/merged.txt.tmp"
+  mv -f -- "$STATE_DIR/merged.txt.tmp" "$STATE_DIR/merged.txt"
+  log info "aplicado: $reason ($count domínios)"
+}
+
+fetch_source() { # $1 = nome, $2 = url
+  local name=$1 url=$2
+  local raw="$WORK/raw.$name" norm="$WORK/norm.$name" cache="$STATE_DIR/cache/$name.list"
+  local protos="=https" redir="=https" new old=0 size
+
+  if [[ $ALLOW_HTTP == yes ]]; then
+    protos+=",http"
+    redir+=",http"
+  fi
+  if [[ ${HB_TEST_ALLOW_FILE:-0} == 1 ]]; then
+    protos+=",file"
+  fi
+
+  case $url in
+    https://*) ;;
+    http://*)
+      if [[ $ALLOW_HTTP != yes ]]; then
+        log warn "$name: http:// não permitido (defina ALLOW_HTTP=yes); fonte ignorada"
+        return 1
+      fi
+      ;;
+    file://*)
+      if [[ ${HB_TEST_ALLOW_FILE:-0} != 1 ]]; then
+        log warn "$name: file:// não permitido; fonte ignorada"
+        return 1
+      fi
+      ;;
+    *)
+      log warn "$name: URL inválida: $url"
+      return 1
+      ;;
+  esac
+
+  if ! command -v curl >/dev/null 2>&1; then
+    log warn "$name: curl não encontrado"
+    return 1
+  fi
+  if ! curl --fail --silent --show-error --location --max-redirs 5 \
+    --proto "$protos" --proto-redir "$redir" \
+    --connect-timeout 10 --max-time "$CURL_TIMEOUT" \
+    --max-filesize "$MAX_SOURCE_BYTES" \
+    --output "$raw" -- "$url" 2>"$WORK/curl.err"; then
+    log warn "$name: falha no download ($(head -c 200 "$WORK/curl.err" | tr '\n' ' ')); mantendo versão anterior"
+    return 1
+  fi
+
+  size=$(stat -c %s -- "$raw")
+  if ((size > MAX_SOURCE_BYTES)); then
+    log warn "$name: arquivo maior que MAX_SOURCE_BYTES; mantendo versão anterior"
+    return 1
+  fi
+
+  normalize "$raw" >"$norm"
+  new=$(wc -l <"$norm")
+  if [[ -f $cache ]]; then
+    old=$(wc -l <"$cache")
+  fi
+  if ((new < MIN_SOURCE_DOMAINS)); then
+    log warn "$name: só $new domínios válidos (mínimo $MIN_SOURCE_DOMAINS); mantendo versão anterior"
+    return 1
+  fi
+  if ((old > 0 && new * 100 < old * MIN_SOURCE_RATIO)); then
+    log warn "$name: lista encolheu de $old para $new domínios (mínimo ${MIN_SOURCE_RATIO}%); mantendo versão anterior"
+    return 1
+  fi
+
+  install -m 0644 -- "$norm" "$cache.tmp"
+  mv -f -- "$cache.tmp" "$cache"
+  log info "$name: $new domínios (antes: $old)"
+}
+
+cmd_update() {
+  local name url f base n keep ok=0 fail=0 listed=0
+  local -a names=()
+  if ((DRY_RUN)); then
+    die "--dry-run não é suportado em 'update'; use 'apply --dry-run'" "$E_USAGE"
+  fi
+  mkdir -p -- "$STATE_DIR/cache"
+
+  while read -r name url; do
+    listed=$((listed + 1))
+    names+=("$name")
+    if fetch_source "$name" "$url"; then
+      ok=$((ok + 1))
+    else
+      fail=$((fail + 1))
+    fi
+  done < <(read_sources)
+
+  # Remove do cache as fontes que saíram do sources.txt.
+  if [[ -r $CONF_DIR/sources.txt ]]; then
+    for f in "$STATE_DIR"/cache/*.list; do
+      base=$(basename -- "$f" .list)
+      keep=0
+      for n in ${names[@]+"${names[@]}"}; do
+        if [[ $n == "$base" ]]; then
+          keep=1
+        fi
+      done
+      if ((!keep)); then
+        rm -f -- "$f"
+        log info "$base: fonte removida da configuração; cache apagado"
+      fi
+    done
+  fi
+
+  if ((ok > 0 || listed == 0)); then
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$STATE_DIR/last-update"
+  fi
+  log info "fontes: $ok atualizadas, $fail com falha"
+
+  cmd_apply update
+
+  if ((fail > 0)); then
+    return "$E_SOURCES"
+  fi
+}
+
+cmd_check() {
+  DRY_RUN=1
+  build_merged "$WORK/merged.txt"
+  build_block "$WORK/merged.txt" "$WORK/block.txt"
+  analyze_hosts "$WORK/block.txt"
+  printf '%s\n' "$HOSTS_STATE"
+  [[ $HOSTS_STATE == ok ]]
+}
+
+cmd_status() {
+  local f n last="nunca"
+  DRY_RUN=1
+  build_merged "$WORK/merged.txt"
+  build_block "$WORK/merged.txt" "$WORK/block.txt"
+  analyze_hosts "$WORK/block.txt"
+  if [[ -r $STATE_DIR/last-update ]]; then
+    last=$(<"$STATE_DIR/last-update")
+  fi
+  printf 'Arquivo hosts    : %s\n' "$HOSTS_FILE"
+  printf 'Estado do bloco  : %s\n' "$HOSTS_STATE"
+  printf 'Domínios         : %s\n' "$(wc -l <"$WORK/merged.txt")"
+  printf 'Última atualiz.  : %s\n' "$last"
+  printf 'Fontes em cache  :\n'
+  for f in "$STATE_DIR"/cache/*.list; do
+    n=$(wc -l <"$f")
+    printf '  %-24s %8s domínios\n' "$(basename -- "$f" .list)" "$n"
+  done
+}
+
+cmd_remove() {
+  if ((!DRY_RUN)); then
+    acquire_lock
+  fi
+  : >"$WORK/empty-block"
+  analyze_hosts "$WORK/empty-block"
+  case $HOSTS_STATE in
+    missing)
+      log info "nenhum bloco encontrado em $HOSTS_FILE"
+      return 0
+      ;;
+    ambiguous)
+      if ((!FORCE)); then
+        die "marcadores do bloco em estado ambíguo; corrija manualmente ou use --force" "$E_AMBIGUOUS"
+      fi
+      log warn "removendo apenas as linhas de marcador; entradas antigas fora delas permanecem"
+      ;;
+  esac
+  compose_hosts "$WORK/empty-block" "$WORK/hosts.new" 0
+  if ((DRY_RUN)); then
+    log info "[dry-run] o bloco seria removido"
+    show_diff "$WORK/hosts.new"
+    return 0
+  fi
+  mkdir -p -- "$STATE_DIR"
+  backup_hosts
+  write_hosts "$WORK/hosts.new"
+  log info "bloco removido de $HOSTS_FILE"
+}
+
+# --------------------------------------------------------------------------
+# Principal
+# --------------------------------------------------------------------------
+
+main() {
+  local cmd=""
+  while (($# > 0)); do
+    case $1 in
+      -n | --dry-run) DRY_RUN=1 ;;
+      -f | --force) FORCE=1 ;;
+      -v | --verbose) VERBOSE=1 ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -V | --version)
+        printf '%s %s\n' "$PROG" "$VERSION"
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*) die "opção desconhecida: $1 (veja --help)" "$E_USAGE" ;;
+      *)
+        if [[ -n $cmd ]]; then
+          die "argumento inesperado: $1" "$E_USAGE"
+        fi
+        cmd=$1
+        ;;
+    esac
+    shift
+  done
+  cmd=${cmd:-apply}
+
+  check_deps
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/$PROG.XXXXXX")
+  trap cleanup EXIT
+  load_config
+
+  case $cmd in
+    apply) cmd_apply apply ;;
+    update) cmd_update ;;
+    check) cmd_check ;;
+    status) cmd_status ;;
+    remove) cmd_remove ;;
+    *) die "comando desconhecido: $cmd (veja --help)" "$E_USAGE" ;;
+  esac
+}
+
+main "$@"

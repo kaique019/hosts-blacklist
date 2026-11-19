@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+#
+# hosts-blacklist-watch - observa o /etc/hosts com inotify e dispara o
+# gerenciador quando algo muda.
+#
+# Este script não conhece listas, fontes nem o formato do bloco: ele só sabe
+# QUANDO chamar o gerenciador. Quem decide se há algo a corrigir é o próprio
+# hosts-blacklist, que compara o conteúdo antes de escrever (por isso o
+# evento gerado pela própria restauração termina em "nada a fazer").
+#
+# Observa o DIRETÓRIO (e não o arquivo): trocas por rename, que é como a
+# maioria das ferramentas e o próprio gerenciador gravam, desfazem um watch
+# feito direto no arquivo.
+
+set -Eeuo pipefail
+
+HOSTS_FILE=${HB_HOSTS_FILE:-/etc/hosts}
+DEBOUNCE=${HB_WATCH_DEBOUNCE:-2}          # segundos de silêncio antes de disparar
+DEBOUNCE_MAX=${HB_WATCH_DEBOUNCE_MAX:-15} # teto da espera, mesmo com /etc barulhento
+UNIT=${HB_WATCH_UNIT:-hosts-blacklist.service}
+INITIAL=${HB_WATCH_INITIAL:-1}            # dispara uma vez ao iniciar
+read -r -a TRIGGER <<<"${HB_WATCH_CMD:-systemctl start $UNIT}"
+
+if ! command -v inotifywait >/dev/null 2>&1; then
+  echo "hosts-blacklist-watch: inotifywait não encontrado (instale o pacote inotify-tools)" >&2
+  exit 78
+fi
+
+target=$(readlink -f -- "$HOSTS_FILE")
+declare -a watch_dirs=("$(dirname -- "$HOSTS_FILE")")
+if [[ $(dirname -- "$target") != "${watch_dirs[0]}" ]]; then
+  watch_dirs+=("$(dirname -- "$target")")
+fi
+
+run_trigger() {
+  local rc=0
+  "${TRIGGER[@]}" </dev/null || rc=$?
+  if ((rc != 0)); then
+    echo "hosts-blacklist-watch: gatilho terminou com código $rc" >&2
+  fi
+  return 0
+}
+
+# Consome eventos até haver DEBOUNCE segundos de silêncio (ou DEBOUNCE_MAX no total).
+drain() {
+  local deadline=$((SECONDS + DEBOUNCE_MAX)) junk
+  while ((SECONDS < deadline)); do
+    read -r -t "$DEBOUNCE" junk || return 0
+  done
+}
+
+echo "hosts-blacklist-watch: monitorando ${watch_dirs[*]} (alvo: $HOSTS_FILE)" >&2
+
+if [[ $INITIAL == 1 ]]; then
+  run_trigger
+fi
+
+inotifywait -m -q -e close_write,moved_to,moved_from,create,delete \
+  --format '%w%f' "${watch_dirs[@]}" |
+  while IFS= read -r path; do
+    if [[ $path != "$HOSTS_FILE" && $path != "$target" ]]; then
+      continue
+    fi
+    drain
+    run_trigger
+  done
+
+echo "hosts-blacklist-watch: inotifywait terminou; saindo para o systemd reiniciar" >&2
+exit 1

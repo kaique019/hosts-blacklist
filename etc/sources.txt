@@ -1,0 +1,7 @@
+# /etc/hosts-blacklist/sources.txt
+# Listas externas, uma por linha:  nome  URL
+# Aceita formato hosts ("0.0.0.0 dominio") ou um domínio por linha.
+# Apague uma linha para remover a fonte (o cache dela é apagado na próxima atualização).
+#
+# Exemplo:
+# stevenblack  https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts

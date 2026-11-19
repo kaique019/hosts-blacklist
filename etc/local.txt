@@ -1,0 +1,6 @@
+# /etc/hosts-blacklist/local.txt
+# Seus domínios bloqueados manualmente, um por linha. Este arquivo nunca é
+# alterado pelo programa. Também aceita o formato hosts ("0.0.0.0 dominio").
+#
+# anuncios.exemplo.com
+# rastreador.exemplo.net

@@ -1,0 +1,6 @@
+# /etc/hosts-blacklist/allowlist.txt
+# Domínios que NUNCA devem ser bloqueados, mesmo que apareçam em alguma lista.
+# Correspondência exata (subdomínios precisam ser listados um a um).
+# Os hosts das URLs em sources.txt já são liberados automaticamente.
+#
+# cdn.exemplo.com

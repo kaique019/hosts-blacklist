@@ -1,0 +1,30 @@
+[Unit]
+Description=Aplica a blacklist de domínios no /etc/hosts
+Documentation=man:hosts(5)
+# Eventos em sequência (watcher + timer) não podem estourar o limite de partidas.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/hosts-blacklist apply
+SyslogIdentifier=hosts-blacklist
+StateDirectory=hosts-blacklist
+Nice=10
+IOSchedulingClass=idle
+
+# Endurecimento: só precisa escrever em /etc (arquivo temporário + rename),
+# no próprio estado e no lock em /run. Não usa rede.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc /run
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

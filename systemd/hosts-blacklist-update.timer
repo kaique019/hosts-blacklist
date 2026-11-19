@@ -1,0 +1,11 @@
+[Unit]
+Description=Atualização diária das listas de bloqueio
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=hosts-blacklist-update.service
+
+[Install]
+WantedBy=timers.target

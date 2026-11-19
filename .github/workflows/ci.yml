@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependências
+        run: sudo apt-get update && sudo apt-get install -y shellcheck inotify-tools
+      - name: ShellCheck
+        run: shellcheck -x bin/hosts-blacklist bin/hosts-blacklist-watch install.sh uninstall.sh
+      - name: Testes
+        run: bash tests/run.sh
